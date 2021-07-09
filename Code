@@ -1,0 +1,227 @@
+import * as fs from 'fs';
+import * as parser from 'fast-xml-parser';
+import * as xml2js from 'xml2js';
+const regexComments = /<!--[\s\S\n]*?-->/g;
+const regexHeader = /<\?xml version=("|')1(.1|.0)("|') encoding=("|')(UTF-8|utf-8)("|')\s?(standalone=("no"|"yes"))?\?>/gm;
+const regexIndentation = /((<NTE>)\s?|)(<PTXT[\s\S]*?(<\/PTXT>|\/(>))\s?(<\/NTE>)?)/gm;
+const regexTag = /((<NTE>)|<PTXT (\s?CONTEXT=(""|(.+?))\s|)(ID=(.+?) (RDID=(.+?)|)|((RDID=(.+?)|)ID=(.+?)))(>((.+?)|)(<\/PTXT>|\/>|)))/gm;
+const regexCommTag = /(<!--[\s\S]+?-->?)(\s|)<PTXT (\s?CONTEXT=(""|(.+?))\s|)((ID|id)=(.+?)((RDID|rdid)=(.+?)|)|(((RDID|rdid)=(.+?)|)(ID|id)=(.+?)))(>((.+?)|)<\/PTXT>|\/>)/gm;
+const regexTagComm = /<PTXT (\s?CONTEXT=(""|(.+?))\s|)((ID|id)=(.+?)((RDID|rdid)=(.+?)|)|(((RDID|rdid)=(.+?)|)(ID|id)=(.+?)))(>((.+?)|)<\/PTXT>|\/>)(\s|)(<!--[\s\S]+?-->?)/gm;
+const at = ' at line number: ';
+let errorFound = 0;
+let ignoreLine = false;
+
+export interface CheckI18nOption {
+    // path to i18n folder relative to en-gb file
+    appI18nPath?: string;
+    languages?: string[];
+}
+const defaultOption: CheckI18nOption = {
+    // path to i18n folder relative to en-gb file
+    appI18nPath: 'src/assets/i18n',
+    languages: ['en', 'en-us', 'en-gb']
+};
+export function i18nIntegrityCheck(appsRootPaths: string[] = [], option: CheckI18nOption): void {
+    option = { ...defaultOption, ...option };
+    appsRootPaths.forEach(project => {
+        const appNames = fs.readdirSync(project);
+        appNames.forEach(app => {
+            console.log('Integrity check for file ' + app);
+            option.languages.forEach(language => {
+                const filePath = `${project}/${app}/${option.appI18nPath}/${language + '.xml'}`;
+                checkPath(filePath);
+            });
+        });
+    });
+    if (errorFound !== 0) {
+        throw new Error('Error : Not a valid TS-XML language file, please check!');
+    }
+}
+
+// building and checking the path to the files
+function checkPath(filePath: string): void {
+    if (fs.existsSync(filePath)) {
+        const file = fs.readFileSync(filePath, 'utf-8');
+        errorFound += checkDuplicate(file);
+    }
+}
+
+// a method which checks the duplicates tags depending on id and rdid
+function checkDuplicate(file: string): number {
+    const duplicateList: string[] = [];
+    const idList: string[] = [];
+    let stringsPTXT: any[] = [];
+    let stringsNTE: any[] = [];
+    xml2js.parseString(file, (err, json) => {
+        if (err) { throw err; }
+        if (json?.DOC?.PTXT) {
+            stringsPTXT = json.DOC.PTXT;
+        }
+        if (json?.DOC?.NTE) {
+            stringsNTE = json.DOC.NTE;
+        }
+        const stringNTE: any[] = [];
+        stringsNTE.forEach((element: any) => {
+            stringNTE.push(element.PTXT[0]);
+        });
+        if (stringsPTXT) {
+            checkIdRdid(stringsPTXT, idList, duplicateList);
+        }
+        if (stringNTE) {
+            checkIdRdid(stringNTE, idList, duplicateList);
+        }
+    });
+    if (duplicateList.length !== 0) {
+        console.log('Error:Duplicate ids exist: ');
+        console.error(duplicateList);
+        errorFound++;
+    } else {
+        console.log('There are no duplicates!');
+    }
+    if (checkStructure(file) === false) {
+        return;
+    } else {
+        errorFound += checkFormat(file);
+    }
+    return errorFound;
+}
+
+// building and checking if an ts-xml has id, rdid duplicate
+function checkIdRdid(strings: any, idList: string[], duplicateList: string[]): string[] {
+    return strings.forEach((s: any) => {
+        let idValue = s.$.ID;
+        if (idValue === undefined) {
+            idValue = s.$.id;
+        }
+        checkValue(idValue, idList, duplicateList);
+        let rdidValue = s.$.RDID;
+        if (rdidValue === undefined) {
+            rdidValue = s.$.rdid;
+        }
+        if (s.$.RDID === undefined && s.$.rdid === undefined) {
+            return;
+        }
+        if (rdidValue !== idValue && rdidValue !== '') {
+            checkValue(rdidValue, idList, duplicateList);
+        }
+    });
+
+}
+
+// checking if an ts-xml has id, rdid duplicate
+function checkValue(idValue: any, idList: string[], duplicateList: string[]) {
+    if (isDuplicate(idValue, idList)) {
+        duplicateList.push(idValue);
+    } else {
+        return idList.push(idValue);
+    }
+}
+
+// checking if an id, rdid is in idList
+function isDuplicate(idValue: any, idList: string[]) {
+    let idVal = 0;
+    while (idVal < idList.length) {
+        if (idValue === idList[idVal]) {
+            return true;
+        }
+        idVal++;
+    }
+}
+
+// checking the ts-xml structure-xml validator
+function checkStructure(file: string): boolean {
+    const checkingFileStructure = parser.validate(file);
+    if (checkingFileStructure !== true) {
+        console.error('Error : Not a valid TS-XML structure file: ');
+        console.log(checkingFileStructure.err);
+        errorFound++;
+        return false;
+    }
+}
+
+// a method in which we call the others methods
+function checkFormat(file: string): number {
+    const xml = file.split(/\r?\n/);
+    let lineNumber = 0;
+    xml.forEach((line: string) => {
+        lineNumber++;
+        checkHeader(line);
+        checkLine(line, lineNumber);
+        checkTag(line, lineNumber);
+        checkAlignment(line, lineNumber);
+        checkNameOfTag(line, lineNumber);
+    });
+    return errorFound;
+}
+
+// checking if the header is valid
+function checkHeader(line: string): number {
+    if (line.trim().startsWith('<?xml ')) {
+        if (!line.match(regexHeader)) {
+            console.error('Error:Not an appropiate header ' + line);
+            return errorFound++;
+        }
+    }
+}
+
+// checking the indentation of a tag, to be on the same line
+function checkLine(line: string, lineNumber: number): number {
+    if (line.trim().startsWith('<NTE>') || line.trim().startsWith('<PTXT ')) {
+        if (!line.match(regexIndentation)) {
+            console.error('Error:Not a good indentation! ' + line + at + lineNumber);
+            return errorFound++;
+        }
+    }
+}
+
+// checking the component of the tag-ID, RDID
+function checkTag(line: string, lineNumber: number): void {
+    if (line.trim().startsWith('<PTXT') || line.trim().startsWith('<NTE>')) {
+        if (!line.trim().match(regexTag)) {
+            checkMatching(line, lineNumber);
+        }
+    }
+}
+
+// checking the alignment of the tag, if it has comment in front of or behind the tag
+function checkAlignment(line: string, lineNumber: number): void {
+    if (line.trim().startsWith('<PTXT') || (line.trim().substring(0, 4) === '<!--') || line.trim().startsWith('<NTE>')) {
+        if (line.trim().match(regexCommTag) || line.trim().match(regexTagComm)) {
+            checkMatching(line, lineNumber);
+        }
+    }
+}
+
+// matching the component and the alignment of tags
+function checkMatching(line: string, lineNumber: number): number {
+    console.error('Error:Wrong format of tag ' + line + at + lineNumber);
+    return errorFound++;
+}
+
+// checking the name of the tags-to be correctly written
+function checkNameOfTag(line: string, lineNumber: number): number {
+    const comment: number = line.trim().search(regexComments);
+    if (comment === 0) {
+        return;
+    }
+    if (line.trim().startsWith('<!--')) {
+        ignoreLine = true;
+    }
+    if (line.trim().startsWith('-->')) {
+        ignoreLine = false;
+        return;
+    }
+    if (ignoreLine) {
+        return;
+    }
+    if ((line.trim().substring(0, 5) === '<?xml') || (line.trim() === '')) {
+        return;
+    }
+    if (!(line.trim().startsWith('<NTE>') || line.trim().startsWith('<PTXT') || line.trim().substring(0, 4) === '<DOC'
+        || line.trim().substring(0, 6) === '</DOC>'
+        || line.trim().substring(0, 6) === '</NTE>' || line.trim().substring(0, 8) === '</PTXT>'
+        || line.trim().startsWith('</PTXT></NTE>') || line.trim().startsWith('<!DOCTYPE'))) {
+        console.error('Error:The tag is not correctly written! ' + line + at + lineNumber);
+        return errorFound++;
+    }
+}
